@@ -109,7 +109,7 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger("hermes.plugins.session_reset_policy")
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 _META_KEY = "srp_last_user_inbound"
 
@@ -212,14 +212,75 @@ def _time_reset_reason(policy: Dict[str, Any], last: Optional[datetime], now: da
     return None
 
 
-def _session_in_flight(entry: Any) -> bool:
-    """True when the entry's durable active-turn marker says a turn is running.
+class _SessionBusy(Exception):
+    """The conversation has a live turn/worker; a policy reset must DEFER, not fail.
 
-    ``active_turn_token`` is set under the store's lock when a turn starts and
-    CAS-cleared on normal unwind; a stale marker left by a crash is recovered at
-    next startup, so treating it as in-flight is the conservative choice.
+    Raised (never returned) so ``_maybe_reset`` can tell a benign "not now" — log a
+    defer and leave the clock un-advanced — from a real reset failure.
     """
-    return bool(getattr(entry, "active_turn_token", None))
+
+
+def _store_busy(exc: BaseException) -> bool:
+    """True when *exc* (or a cause in its chain) is the store's retryable "busy" refusal.
+
+    ``require_not_executing`` raises ``RuntimeStoreError('session_busy')`` (a live
+    turn/worker) or ``'unknown_execution'`` (an outcome we cannot trust). Both mean
+    "not now", never "broken": the caller must defer and re-arm, not attempt a second
+    rotation. Matched by class name + message so a renamed/absent core module cannot
+    break the plugin (it already guards every core import).
+    """
+    seen: set[int] = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if type(cur).__name__ == "RuntimeStoreError" and str(cur) in ("session_busy", "unknown_execution"):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def _session_in_flight(entry: Any, session_store: Any = None,
+                       session_key: Optional[str] = None) -> bool:
+    """True when a turn/worker is live for *entry*'s conversation, so a reset must defer.
+
+    The durable ``active_turn_token`` marker covers the in-process case (set under the
+    store's lock at turn start, CAS-cleared on unwind, recovered after a crash — so a
+    stale marker is conservatively in-flight). But a turn driven OUT of process — the
+    desktop, or a message dispatched while a prior turn still runs — leaves the marker
+    clear while the store still holds a ``started`` admission; attempting the reset then
+    trips ``require_not_executing`` and the funnel raises ``session_busy`` after a wasted
+    rotation attempt (the "falling back to a bare store rotation" path). Probe the SAME
+    durable state the guard refuses on so the plugin defers (its documented contract)
+    instead of failing. Never raises.
+    """
+    if getattr(entry, "active_turn_token", None):
+        return True
+    sid = getattr(entry, "session_id", None)
+    if session_store is None or not sid:
+        return False
+    try:
+        db = None
+        get_db = getattr(session_store, "_db_for_key", None)
+        if session_key and callable(get_db):
+            db = get_db(session_key)
+        if db is None:
+            db = getattr(session_store, "_db", None)
+        if db is None:
+            return False
+        from hermes_state_mutation_guards import require_not_executing
+        ids = [str(sid)]
+        parent = getattr(entry, "parent_session_id", None)
+        if parent:
+            ids.append(str(parent))
+        with db._read_ctx() as conn:
+            require_not_executing(conn, list(dict.fromkeys(ids)))
+        return False
+    except Exception as exc:
+        if _store_busy(exc):
+            return True
+        logger.debug("session-reset-policy: in-flight probe failed; treating as idle",
+                     exc_info=True)
+        return False
 
 
 def _lookup_entry(session_store: Any, session_key: Optional[str]) -> Any:
@@ -341,7 +402,7 @@ async def _reset_session(gateway: Any, event: Any, source: Any, session_store: A
             if inspect.isawaitable(outcome):
                 await outcome
             return _lookup_entry(session_store, session_key)
-        except Exception:
+        except Exception as exc:
             # Failure AFTER the rotation (e.g. banner/tip bookkeeping in the
             # funnel's tail) must not rotate a second time.
             new_entry = _lookup_entry(session_store, session_key)
@@ -351,6 +412,11 @@ async def _reset_session(gateway: Any, event: Any, source: Any, session_store: A
                     "session-reset-policy: gateway reset funnel failed after rotating %s; "
                     "keeping its result", session_key, exc_info=True)
                 return new_entry
+            if _store_busy(exc):
+                # The session is executing (a race the pre-check could not close): the
+                # store guard refused the rotation. Defer; do NOT fall through to the
+                # bare store rotation, which would refuse identically.
+                raise _SessionBusy(session_key) from exc
             logger.warning(
                 "session-reset-policy: gateway reset funnel failed for %s; falling back to a "
                 "bare store rotation", session_key, exc_info=True)
@@ -358,7 +424,12 @@ async def _reset_session(gateway: Any, event: Any, source: Any, session_store: A
         logger.debug(
             "session-reset-policy: gateway reset funnel not available for %s; using the "
             "degraded store rotation", session_key)
-    return _reset_via_store(source, session_store, session_key)
+    try:
+        return _reset_via_store(source, session_store, session_key)
+    except Exception as exc:
+        if _store_busy(exc):
+            raise _SessionBusy(session_key) from exc
+        raise
 
 
 async def _maybe_reset(event: Any, gateway: Any, session_store: Any,
@@ -399,7 +470,7 @@ async def _maybe_reset(event: Any, gateway: Any, session_store: Any,
         except Exception:
             logger.debug("session_reset clock stamp failed", exc_info=True)
         return None
-    if _session_in_flight(entry):
+    if _session_in_flight(entry, session_store, key):
         logger.info(
             "session-reset-policy: boundary '%s' reached for %s but a turn is in flight; deferring (clock NOT advanced)",
             reason, key,
@@ -408,6 +479,14 @@ async def _maybe_reset(event: Any, gateway: Any, session_store: Any,
 
     try:
         new_entry = await _reset_session(gateway, event, source, session_store, key)
+    except _SessionBusy:
+        # The store's guard refused a live turn the pre-check could not see (a race
+        # between probe and funnel). Same contract as the in-flight defer above.
+        logger.info(
+            "session-reset-policy: boundary '%s' reached for %s but the session is busy; "
+            "deferring (clock NOT advanced)", reason, key,
+        )
+        return None
     except Exception:
         logger.warning(
             "session-reset-policy: reset_session(%s) failed; continuing on the existing session",
