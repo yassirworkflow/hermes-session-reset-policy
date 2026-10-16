@@ -109,13 +109,13 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger("hermes.plugins.session_reset_policy")
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 _META_KEY = "srp_last_user_inbound"
 
 
-def _read_session_reset_policy(profile: Optional[str]) -> Optional[Dict[str, Any]]:
-    """Return the ``session_reset`` block for *profile*, or None when unset/invalid.
+def _read_config_block(profile: Optional[str], block: str = "session_reset") -> Optional[Dict[str, Any]]:
+    """Return the top-level *block* dict for *profile*, or None when unset/invalid.
 
     ``pre_gateway_dispatch`` fires before the per-profile runtime scope is
     installed, so the ambient ``load_config_readonly()`` would read the launch
@@ -143,13 +143,21 @@ def _read_session_reset_policy(profile: Optional[str]) -> Optional[Dict[str, Any
         finally:
             if token is not None:
                 reset_hermes_home_override(token)
-        policy = (config or {}).get("session_reset")
-        if not isinstance(policy, dict) or not policy:
+        value = (config or {}).get(block)
+        if not isinstance(value, dict) or not value:
             return None  # unset/empty block: treat as "none", skip quietly
-        return policy
+        return value
     except Exception:
-        logger.debug("session_reset policy read failed; skipping", exc_info=True)
+        logger.debug("config block %r read failed; skipping", block, exc_info=True)
         return None
+
+
+def _read_session_reset_policy(profile: Optional[str]) -> Optional[Dict[str, Any]]:
+    """The ``session_reset`` block for *profile* (thin wrapper over _read_config_block).
+
+    Kept as this module's policy seam: callers and the test-suite patch THIS name.
+    """
+    return _read_config_block(profile, "session_reset")
 
 
 def _parse_iso(value: Any) -> Optional[datetime]:
@@ -432,6 +440,60 @@ async def _reset_session(gateway: Any, event: Any, source: Any, session_store: A
         raise
 
 
+_CONTEXT_GUARD_MODULE: Any = None
+_CONTEXT_GUARD_LOADED = False
+
+
+def _load_context_guard() -> Any:
+    """Import the sibling ``context_guard`` module under either loader shape.
+
+    Production loads this plugin as a package (``spec_from_file_location`` with
+    submodule search locations), so the relative import resolves. The standalone
+    test harness loads ``__init__.py`` as a bare module, where a relative import
+    cannot work — so fall back to loading ``context_guard.py`` by path. Result is
+    cached; returns None (guard disabled) on any failure.
+    """
+    global _CONTEXT_GUARD_MODULE, _CONTEXT_GUARD_LOADED
+    if _CONTEXT_GUARD_LOADED:
+        return _CONTEXT_GUARD_MODULE
+    _CONTEXT_GUARD_LOADED = True
+    mod = None
+    try:
+        if __package__:
+            import importlib
+            mod = importlib.import_module(f"{__package__}.context_guard")
+    except Exception:
+        mod = None
+    if mod is None:
+        try:
+            import importlib.util
+            from pathlib import Path
+            path = Path(__file__).with_name("context_guard.py")
+            spec = importlib.util.spec_from_file_location(f"{__name__}.context_guard", path)
+            if spec is not None and spec.loader is not None:
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+        except Exception:
+            mod = None
+            logger.debug("session-reset-policy: context_guard import failed; guard disabled",
+                         exc_info=True)
+    _CONTEXT_GUARD_MODULE = mod
+    return mod
+
+
+def _observe_context_guard(profile: Optional[str], session_store: Any,
+                           key: Optional[str], entry: Any) -> None:
+    """Run one shadow pass of the context-limit guard. Never raises, never enforces."""
+    try:
+        guard = _load_context_guard()
+        if guard is None or key is None or entry is None:
+            return
+        cfg = guard.resolve_config(_read_config_block(profile, "context_guard"))
+        guard.observe(cfg, session_store, key, entry)
+    except Exception:
+        logger.debug("session-reset-policy: context_guard shadow pass failed", exc_info=True)
+
+
 async def _maybe_reset(event: Any, gateway: Any, session_store: Any,
                        session_key: Optional[str] = None, **_extra: Any) -> Optional[Dict[str, str]]:
     """pre_gateway_dispatch body: reset the session when the policy says so.
@@ -452,13 +514,18 @@ async def _maybe_reset(event: Any, gateway: Any, session_store: Any,
         return None
 
     profile = getattr(source, "profile", None)
-    policy = _read_session_reset_policy(profile)
-    if not policy:
-        return None
     key = _resolve_session_key(gateway, source, session_key)
     entry = _lookup_entry(session_store, key)
     if key is None or entry is None:
         return None  # no key or no route yet -> brand-new conversation anyway
+
+    # Phase 1: context-limit shadow instrumentation (log-only, isolated). Runs on
+    # every inbound message, independent of the session_reset policy below.
+    _observe_context_guard(profile, session_store, key, entry)
+
+    policy = _read_session_reset_policy(profile)
+    if not policy:
+        return None
 
     now = datetime.now()
     reason = _time_reset_reason(policy, _last_user_inbound(entry), now)
